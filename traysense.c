@@ -981,7 +981,7 @@ static int find_taskbars(HWND *out, int max)
     return n;
 }
 
-typedef struct { HWND tb; LONG ok, trayL, appsR; } SCAN;
+typedef struct { HWND tb; LONG ok, trayL, appsR, appsL, leftR; } SCAN;
 static SCAN g_scan[MAX_BARS];
 static CRITICAL_SECTION g_scanCs;
 static IUIAutomation *g_uia;
@@ -1021,7 +1021,7 @@ static int starts(const wchar_t *s, const wchar_t *p)
     return s && !wcsncmp(s, p, wcslen(p));
 }
 
-static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps)
+static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps, LONG *outAppsL, LONG *outLeftR)
 {
     static RECT rc[256];
     static BYTE app[256];
@@ -1055,17 +1055,28 @@ static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps)
     if (arr) IUIAutomationElementArray_Release(arr);
     if (root) IUIAutomationElement_Release(root);
 
-    int appsR = tr.left, trayL = tr.right, apps = 0;
-    for (int i = 0; i < n; i++)
-        if (app[i] && rc[i].right > appsR) { appsR = rc[i].right; apps = 1; }
-    for (int i = 0; i < n; i++)
-        if (!app[i] && rc[i].left >= appsR && rc[i].left < trayL) trayL = rc[i].left;
+    int appsL = tr.right, appsR = tr.left, trayL = tr.right, leftR = tr.left, apps = 0;
+    for (int i = 0; i < n; i++) {
+        if (app[i]) {
+            if (rc[i].left < appsL) appsL = rc[i].left;
+            if (rc[i].right > appsR) appsR = rc[i].right;
+            apps = 1;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!app[i]) {
+            if (rc[i].left >= appsR && rc[i].left < trayL) trayL = rc[i].left;
+            if (rc[i].left < appsL && rc[i].right <= appsL && rc[i].right > leftR) leftR = rc[i].right;
+        }
+    }
     HWND tn = FindWindowExW(tb, NULL, L"TrayNotifyWnd", NULL);
     RECT nr;
     if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left && nr.left < trayL) trayL = nr.left;
     if ((primary && !apps) || trayL <= appsR) return 0;
     *outTray = trayL;
     *outApps = appsR;
+    *outAppsL = appsL;
+    *outLeftR = leftR;
     return 1;
 }
 
@@ -1077,8 +1088,8 @@ static void uia_scan(void)
     int n = find_taskbars(tbs, MAX_BARS), ok = uia_init();
     for (int i = 0; i < n; i++) {
         res[i].tb = tbs[i];
-        res[i].trayL = res[i].appsR = 0;
-        res[i].ok = ok && scan_one(tbs[i], tbs[i] == main, &res[i].trayL, &res[i].appsR);
+        res[i].trayL = res[i].appsR = res[i].appsL = res[i].leftR = 0;
+        res[i].ok = ok && scan_one(tbs[i], tbs[i] == main, &res[i].trayL, &res[i].appsR, &res[i].appsL, &res[i].leftR);
     }
     EnterCriticalSection(&g_scanCs);
     ZeroMemory(g_scan, sizeof g_scan);
@@ -1086,42 +1097,47 @@ static void uia_scan(void)
     LeaveCriticalSection(&g_scanCs);
 }
 
-static int scan_for(HWND tb, int *trayL, int *appsR)
+static int scan_for(HWND tb, int *trayL, int *appsR, int *appsL, int *leftR)
 {
     int ok = 0;
     EnterCriticalSection(&g_scanCs);
     for (int i = 0; i < MAX_BARS; i++)
-        if (g_scan[i].tb == tb && g_scan[i].ok) { *trayL = g_scan[i].trayL; *appsR = g_scan[i].appsR; ok = 1; break; }
+        if (g_scan[i].tb == tb && g_scan[i].ok) {
+            *trayL = g_scan[i].trayL;
+            *appsR = g_scan[i].appsR;
+            *appsL = g_scan[i].appsL;
+            *leftR = g_scan[i].leftR;
+            ok = 1;
+            break;
+        }
     LeaveCriticalSection(&g_scanCs);
     return ok;
 }
 
 static void bar_place(void)
 {
-    RECT tr, nr;
+    RECT tr;
     if (!bar->wnd) return;
     if (!bar->tb || !GetWindowRect(bar->tb, &tr) || tr.bottom - tr.top > tr.right - tr.left) {
         ShowWindow(bar->wnd, SW_HIDE);
         return;
     }
     get_dpi();
-    int trayL, appsR, scan = scan_for(bar->tb, &trayL, &appsR);
+    int trayL, appsR, appsL, leftR, scan = scan_for(bar->tb, &trayL, &appsR, &appsL, &leftR);
     if (!scan) {
-        HWND tn = FindWindowExW(bar->tb, NULL, bar->primary ? L"TrayNotifyWnd" : L"ClockButton", NULL);
-        if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left) trayL = nr.left;
-        else trayL = tr.right - (bar->primary ? SC(280) : SC(12));
-        appsR = tr.left;
+        leftR = tr.left;
+        appsL = tr.right;
     }
     int h = tr.bottom - tr.top;
-    int right = trayL - SC(10) + SC(g_offset);
-    int avail = right - (scan ? appsR + SC(6) : tr.left);
+    int left = leftR + SC(10) + SC(g_offset);
+    int avail = (scan ? appsL - SC(6) : tr.right) - left;
     int compact = bar->compact ? bar->wideW > avail - SC(10) : bar->wideW > avail;
     if (compact != bar->compact) {
         bar->compact = compact;
         bar->sig[0] = 0;
         PostMessageW(g_wnd, WM_SAMPLED, 0, 0);
     }
-    int x = right - bar->W, y = tr.top;
+    int x = left, y = tr.top;
     if (bar->child) { POINT p = { x, y }; ScreenToClient(bar->tb, &p); x = p.x; y = p.y; }
     RECT want = { x, y, x + bar->W, y + h };
     int top = bar->child ? GetWindow(bar->tb, GW_CHILD) == bar->wnd : 1;
